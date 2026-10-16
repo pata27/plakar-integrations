@@ -213,13 +213,12 @@ incus config set storage.backups_volume <pool>/backups-staging
 - **Extended attributes / file capabilities: captured, not yet
   restored.** The importer records every tar entry's PAX
   `SCHILY.xattr.*` attributes (including `security.capability`, what
-  `getcap` reads) as kloset xattr records, and the exporter is ready to
-  reinject them into the rebuilt tar. However the current kloset
-  `Snapshot.Export()` does not hand xattr records to exporters, so
-  **restored files lose their xattrs and file capabilities** (e.g.
-  `ping`'s `cap_net_raw`) until that is fixed upstream — reapply with
-  `setcap` after restore where needed. The plugin side is done and will
-  light up with the kloset fix, tracked in this repo's TODO.
+  `getcap` reads) as kloset xattr records, but the exporter cannot
+  reinject them: over the plugin transport each record must be written
+  as soon as it arrives (holding one back deadlocks the restore), and
+  kloset sends xattr records only after the whole tree. So **restored
+  files lose their xattrs and file capabilities** (e.g. `ping`'s
+  `cap_net_raw`): reapply with `setcap` after restore where needed.
 - **Hardlink identity.** Hardlinks round-trip as true hardlinks
   incus-to-incus. Restoring to a non-Incus destination materializes
   them as relative symlinks instead (true hardlink identity is not

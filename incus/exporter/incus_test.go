@@ -330,12 +330,20 @@ func TestExportShortReadDetected(t *testing.T) {
 	}
 }
 
-// TestExportReinjectsXattrIntoPAXRecords covers audit finding #2: an
-// xattr record fed in protocol order (immediately after its owning file
-// record, same Pathname - see incus.go's Export doc comment) must be
-// folded into that file's tar header PAXRecords, byte-identical to the
-// value carried by the record's Reader.
-func TestExportReinjectsXattrIntoPAXRecords(t *testing.T) {
+// closeSignal is a Reader whose Close is observable, standing in for the
+// gRPC stream reader of go-kloset-sdk.
+type closeSignal struct {
+	io.Reader
+	closed chan struct{}
+}
+
+func (c *closeSignal) Close() error { close(c.closed); return nil }
+
+// TestExportDoesNotHoldRecordsBack reproduces the plugin transport: the
+// SDK delivers the next record only after the current record's Reader is
+// closed. An exporter that waits for the next record before consuming
+// the current one hangs forever (live restore stuck at 1 KiB uploaded).
+func TestExportDoesNotHoldRecordsBack(t *testing.T) {
 	sink := &fakeSink{}
 	exp := newExporterWithSink("restored-4", sink)
 
@@ -344,125 +352,50 @@ func TestExportReinjectsXattrIntoPAXRecords(t *testing.T) {
 	done := make(chan error, 1)
 	go func() { done <- exp.Export(context.Background(), records, results) }()
 
-	capability := "\x01\x00\x00\x02\x00\x20\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00"
-	feed := []*connectors.Record{
-		{Pathname: "/backup/container/rootfs/bin/ping",
-			FileInfo: objects.FileInfo{Lname: "ping", Lsize: 4, Lmode: 0755},
-			Reader:   io.NopCloser(strings.NewReader("elf\n"))},
-		{Pathname: "/backup/container/rootfs/bin/ping",
-			IsXattr:   true,
-			XattrName: "security.capability",
-			XattrType: objects.AttributeExtended,
-			Reader:    io.NopCloser(strings.NewReader(capability))},
-	}
-	for _, r := range feed {
-		records <- r
+	for _, body := range []string{"name: test\n", "test\n"} {
+		rd := &closeSignal{Reader: strings.NewReader(body), closed: make(chan struct{})}
+		records <- &connectors.Record{Pathname: "/backup/f",
+			FileInfo: objects.FileInfo{Lname: "f", Lsize: int64(len(body)), Lmode: 0644}, Reader: rd}
+		select {
+		case <-rd.closed:
+		case <-time.After(5 * time.Second):
+			t.Fatal("record reader not closed before the next record: exporter holds records back (deadlock over gRPC)")
+		}
 	}
 	close(records)
 	if err := <-done; err != nil {
 		t.Fatalf("Export: %v", err)
-	}
-	for range len(feed) {
-		<-results
-	}
-
-	tr := tar.NewReader(bytes.NewReader(sink.tarball.Bytes()))
-	hdr, err := tr.Next()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if hdr.Name != "backup/container/rootfs/bin/ping" {
-		t.Fatalf("entry name: %q", hdr.Name)
-	}
-	got, ok := hdr.PAXRecords["SCHILY.xattr.security.capability"]
-	if !ok {
-		t.Fatalf("PAXRecords missing SCHILY.xattr.security.capability: %+v", hdr.PAXRecords)
-	}
-	if got != capability {
-		t.Fatalf("xattr value: got %q, want %q", got, capability)
-	}
-	if _, err := tr.Next(); err != io.EOF {
-		t.Fatalf("want a single tar entry (xattr record must not appear as its own entry), got err=%v", err)
 	}
 }
 
-// TestRoundtripXattrSurvivesImportExport is the end-to-end sanity check
-// requested for audit finding #2: a tar with a PAX xattr, run through
-// the importer to produce records, then those records run through the
-// exporter, must reproduce the same PAXRecords in the rebuilt tar.
-func TestRoundtripXattrSurvivesImportExport(t *testing.T) {
-	// Build the source tar the same way the importer test does, kept
-	// self-contained here to avoid an import-package dependency.
-	var srcBuf bytes.Buffer
-	stw := tar.NewWriter(&srcBuf)
-	capability := "\x01\x00\x00\x02\x00\x20\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00"
-	body := "#!/bin/true\n"
-	srcHdr := tar.Header{
-		Name:     "backup/container/rootfs/bin/ping",
-		Mode:     0755,
-		Typeflag: tar.TypeReg,
-		Size:     int64(len(body)),
-		PAXRecords: map[string]string{
-			"SCHILY.xattr.security.capability": capability,
-		},
-	}
-	if err := stw.WriteHeader(&srcHdr); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := stw.Write([]byte(body)); err != nil {
-		t.Fatal(err)
-	}
-	if err := stw.Close(); err != nil {
-		t.Fatal(err)
-	}
-
-	// Read it back as plain tar records + PAX-derived xattr record, the
-	// same shape the incus importer produces (see importer/incus.go).
-	str := tar.NewReader(bytes.NewReader(srcBuf.Bytes()))
-	srcHdrRead, err := str.Next()
-	if err != nil {
-		t.Fatal(err)
-	}
-	bodyBytes, err := io.ReadAll(str)
-	if err != nil {
-		t.Fatal(err)
-	}
-
+// An xattr record cannot be folded into a header already written: it is
+// reported as a per-record error, never as a tar entry of its own.
+func TestExportRejectsXattrRecord(t *testing.T) {
 	sink := &fakeSink{}
 	exp := newExporterWithSink("restored-5", sink)
-	records := make(chan *connectors.Record)
-	results := make(chan *connectors.Result, 8)
-	done := make(chan error, 1)
-	go func() { done <- exp.Export(context.Background(), records, results) }()
 
-	feed := []*connectors.Record{
-		{Pathname: "/" + srcHdrRead.Name,
-			FileInfo: objects.FileInfo{Lname: "ping", Lsize: int64(len(bodyBytes)), Lmode: 0755},
-			Reader:   io.NopCloser(bytes.NewReader(bodyBytes))},
-		{Pathname: "/" + srcHdrRead.Name,
-			IsXattr:   true,
-			XattrName: "security.capability",
-			XattrType: objects.AttributeExtended,
-			Reader:    io.NopCloser(strings.NewReader(srcHdrRead.PAXRecords["SCHILY.xattr.security.capability"]))},
-	}
-	for _, r := range feed {
-		records <- r
-	}
+	records := make(chan *connectors.Record, 2)
+	results := make(chan *connectors.Result, 8)
+	records <- &connectors.Record{Pathname: "/backup/container/rootfs/bin/ping",
+		FileInfo: objects.FileInfo{Lname: "ping", Lsize: 4, Lmode: 0755},
+		Reader:   io.NopCloser(strings.NewReader("elf\n"))}
+	records <- &connectors.Record{Pathname: "/backup/container/rootfs/bin/ping", IsXattr: true,
+		XattrName: "security.capability", Reader: io.NopCloser(strings.NewReader("cap"))}
 	close(records)
-	if err := <-done; err != nil {
+	if err := exp.Export(context.Background(), records, results); err != nil {
 		t.Fatalf("Export: %v", err)
 	}
-	for range len(feed) {
-		<-results
+	if r := <-results; r.Err != nil {
+		t.Fatalf("file record: %v", r.Err)
 	}
-
-	outTr := tar.NewReader(bytes.NewReader(sink.tarball.Bytes()))
-	outHdr, err := outTr.Next()
-	if err != nil {
+	if r := <-results; r.Err == nil || !strings.Contains(r.Err.Error(), "security.capability") {
+		t.Fatalf("xattr record: want an error naming the attribute, got %v", r.Err)
+	}
+	tr := tar.NewReader(bytes.NewReader(sink.tarball.Bytes()))
+	if _, err := tr.Next(); err != nil {
 		t.Fatal(err)
 	}
-	if outHdr.PAXRecords["SCHILY.xattr.security.capability"] != capability {
-		t.Fatalf("roundtrip xattr value: got %q, want %q",
-			outHdr.PAXRecords["SCHILY.xattr.security.capability"], capability)
+	if _, err := tr.Next(); err != io.EOF {
+		t.Fatalf("want a single tar entry, got err=%v", err)
 	}
 }

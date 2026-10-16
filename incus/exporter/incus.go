@@ -106,42 +106,20 @@ func (p *Exporter) Export(ctx context.Context, records <-chan *connectors.Record
 	// records in import order (true today, beta-validated); if kloset ever
 	// reorders records, this needs revisiting.
 	//
-	// xattr records (rec.IsXattr) arrive right after the file record they
-	// belong to (same Pathname) - that's the ordering the incus importer
-	// emits (mirroring plakar-integrations/fs/importer) and the one this
-	// exporter's "replay in import order" guarantee above depends on. So a
-	// file record can't be written immediately: it must be held ("pending")
-	// until either the next non-xattr record or end-of-stream tells us no
-	// more xattrs are coming for it, accumulating any xattrs seen in the
-	// meantime into its tar header's PAXRecords. Holding the record is
-	// cheap and safe: its Reader is repo-backed/lazy, not a live resource
-	// that needs immediate draining.
-	var (
-		pending       *connectors.Record
-		pendingXattrs map[string]string
-	)
-
-	// flushPending writes the held record (if any) as a tar entry, with
-	// any accumulated xattrs folded into its PAXRecords, and acks it.
-	// It returns a non-nil error only for failures that corrupt the tar
-	// stream itself (WriteHeader/body copy) - those abort Export. Header
-	// build errors and the nil-reader guard are per-record and reported
-	// via an Error result without aborting the rest of the stream, exactly
-	// as before this change.
-	flushPending := func() error {
-		if pending == nil {
-			return nil
-		}
-		p, xattrs := pending, pendingXattrs
-		pending, pendingXattrs = nil, nil
-
+	// Each record is written (and acked) as soon as it arrives. Over the
+	// plugin gRPC transport a record's body is streamed in-band and the
+	// next record is only delivered once this one's Reader is closed (by
+	// Ok/Error): holding a record back to wait for a later one deadlocks
+	// the restore on the first regular file (seen live, v0.1.3/v0.1.4).
+	// Consequence: xattr records cannot be folded into an already written
+	// header. kloset only sends them after the whole tree, and only to
+	// exporters advertising FLAG_EXPORTXATTR (this one does not), so none
+	// arrive in practice.
+	writeRecord := func(p *connectors.Record) error {
 		hdr, err := tarHeader(p)
 		if err != nil {
 			results <- p.Error(err)
 			return nil
-		}
-		if len(xattrs) > 0 {
-			hdr.PAXRecords = xattrs
 		}
 		if hdr.Typeflag == tar.TypeReg && hdr.Size > 0 && p.Reader == nil {
 			// Writing this header would promise hdr.Size bytes of
@@ -181,10 +159,6 @@ loop:
 		select {
 		case <-ctx.Done():
 			ret = ctx.Err()
-			if pending != nil {
-				results <- pending.Error(ret)
-				pending, pendingXattrs = nil, nil
-			}
 			break loop
 
 		case rec, ok := <-records:
@@ -192,48 +166,17 @@ loop:
 				break loop
 			}
 			if rec.Err != nil {
-				if err := flushPending(); err != nil {
-					results <- rec.Error(err)
-					ret = err
-					break loop
-				}
 				results <- rec.Ok()
 				continue
 			}
 			if rec.IsXattr {
-				if pending == nil || pending.Pathname != rec.Pathname {
-					// Protocol violation: an xattr record must follow
-					// its owning file record with the same Pathname.
-					results <- rec.Error(fmt.Errorf("incus: xattr record %q (%s) has no matching pending file record", rec.Pathname, rec.XattrName))
-					continue
-				}
-				value, err := io.ReadAll(rec.Reader)
-				if err != nil {
-					results <- rec.Error(err)
-					continue
-				}
-				if pendingXattrs == nil {
-					pendingXattrs = make(map[string]string)
-				}
-				pendingXattrs["SCHILY.xattr."+rec.XattrName] = string(value)
-				results <- rec.Ok()
+				results <- rec.Error(fmt.Errorf("incus: xattr record %q (%s): extended attributes cannot be restored by this exporter", rec.Pathname, rec.XattrName))
 				continue
 			}
-
-			// A new file/dir/symlink record: whatever was pending has
-			// now seen all of its xattrs (if any), flush it.
-			if err := flushPending(); err != nil {
-				results <- rec.Error(err)
+			if err := writeRecord(rec); err != nil {
 				ret = err
 				break loop
 			}
-			pending = rec
-		}
-	}
-
-	if pending != nil {
-		if err := flushPending(); err != nil && ret == nil {
-			ret = err
 		}
 	}
 
